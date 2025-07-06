@@ -7,29 +7,26 @@ import os
 from flask_cors import CORS
 import logging
 import re
+import requests
 
 # === CONFIG ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# === Setup ===
+# === SETUP ===
 app = Flask(__name__)
 CORS(app)
 
-# Logging configuration
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# === UTILS ===
 def is_valid_hostname(hostname):
-    """
-    Validates that the hostname contains only allowed characters.
-    """
     return re.match(r'^[a-zA-Z0-9.-]+$', hostname) is not None
 
 def get_certificate_info(hostname):
-    """
-    Connects to the given hostname on port 443 and retrieves its SSL certificate.
-    """
     context = ssl.create_default_context()
     try:
         with socket.create_connection((hostname, 443), timeout=10) as sock:
@@ -38,18 +35,14 @@ def get_certificate_info(hostname):
     except socket.gaierror:
         raise Exception(f"DNS lookup failed for hostname '{hostname}'.")
     except ssl.SSLCertVerificationError as e:
-        logger.warning(f"SSL certificate verification error for {hostname}: {e}")
+        logger.warning(f"SSL cert verification error for {hostname}: {e}")
         raise e
     except Exception as e:
-        logger.error(f"Error retrieving certificate for {hostname}: {e}")
+        logger.error(f"Error retrieving cert for {hostname}: {e}")
         raise e
 
 def verify_certificate(cert):
-    """
-    Parses and extracts relevant information from the certificate.
-    """
     result = {}
-
     try:
         not_after = datetime.strptime(cert.get('notAfter', ''), '%b %d %H:%M:%S %Y %Z')
         not_before = datetime.strptime(cert.get('notBefore', ''), '%b %d %H:%M:%S %Y %Z')
@@ -63,17 +56,14 @@ def verify_certificate(cert):
         result['valid_until'] = 'Invalid date'
         logger.warning(f"Date parsing error: {e}")
 
-    # Extract issuer info
     issuer_info = {}
     for item in cert.get('issuer', []):
         for sub_item in item:
             issuer_info[sub_item[0]] = sub_item[1]
     result['issuer'] = issuer_info.get('organizationName') or \
                        issuer_info.get('organizationalUnitName') or \
-                       issuer_info.get('commonName') or \
-                       'Unknown'
+                       issuer_info.get('commonName') or 'Unknown'
 
-    # Extract subject (common name)
     subject_info = {}
     for item in cert.get('subject', []):
         for sub_item in item:
@@ -83,9 +73,9 @@ def verify_certificate(cert):
     return result
 
 def generate_feedback_with_gemini(cert_data):
-    """
-    Generates human-readable feedback using Gemini AI.
-    """
+    suspicious_keywords = ['paypal', 'verify', 'secure', 'login', 'account', 'update']
+    domain = cert_data.get("common_name", "").lower()
+
     prompt = (
         f"Analyze this SSL certificate:\n\n"
         f"Issuer: {cert_data['issuer']}\n"
@@ -93,9 +83,15 @@ def generate_feedback_with_gemini(cert_data):
         f"Valid From: {cert_data['valid_from']}\n"
         f"Valid Until: {cert_data['valid_until']}\n"
         f"Validity: {'Valid' if cert_data['valid'] else 'Invalid'}\n\n"
-        f"Is this certificate secure or suspicious? Provide a simple explanation focusing on the issuer and domain. "
-        f"Keep the response concise and under 150 words."
     )
+
+    if any(keyword in domain for keyword in suspicious_keywords):
+        prompt += (
+            "The domain name contains suspicious keywords. "
+            "Please determine if this domain might be malicious or attempting phishing.\n"
+        )
+
+    prompt += "Keep your explanation under 150 words."
 
     try:
         model = genai.GenerativeModel("gemini-2.0-flash")
@@ -105,21 +101,66 @@ def generate_feedback_with_gemini(cert_data):
         logger.error(f"Gemini feedback error: {e}")
         return "Could not generate AI feedback due to internal error."
 
+def check_url_with_google_safe_browsing(url_to_check):
+    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_API_KEY}"
+    payload = {
+        "client": {
+            "clientId": "student-checker",
+            "clientVersion": "1.0"
+        },
+        "threatInfo": {
+            "threatTypes": [
+                "MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"
+            ],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url_to_check}]
+        }
+    }
+
+    try:
+        response = requests.post(endpoint, json=payload)
+        result = response.json()
+        if result.get("matches"):
+            return {"safe": False, "details": result["matches"]}
+        return {"safe": True, "details": None}
+    except Exception as e:
+        logger.error(f"Safe Browsing API error: {e}")
+        return {"safe": None, "error": "Google Safe Browsing check failed."}
+
+def calculate_risk(cert_data, google_check, feedback):
+    score = 0
+    domain = cert_data.get("common_name", "").lower()
+
+    if not cert_data.get("valid", False):
+        score += 2
+
+    if any(keyword in domain for keyword in ['paypal', 'verify', 'secure', 'login', 'update']):
+        score += 3
+
+    if "phishing" in feedback.lower() or "suspicious" in feedback.lower():
+        score += 4
+
+    if google_check.get("safe") is False:
+        score += 5
+
+    if score >= 8:
+        return "High Risk"
+    elif score >= 4:
+        return "Medium Risk"
+    else:
+        return "Low Risk"
+
+# === API ROUTE ===
 @app.route('/api/check-ssl', methods=['POST'])
 def check_ssl():
-    """
-    API endpoint to check SSL certificate for a given hostname.
-    """
     data = request.get_json()
     hostname = data.get('hostname')
 
     if not hostname:
         return jsonify({"error": "Hostname is required."}), 400
 
-    # Remove trailing slash
     hostname = hostname.rstrip('/')
-
-    # Validate format
     if not is_valid_hostname(hostname):
         return jsonify({"error": "Invalid hostname format."}), 400
 
@@ -127,14 +168,21 @@ def check_ssl():
         cert = get_certificate_info(hostname)
         cert_data = verify_certificate(cert)
         feedback = generate_feedback_with_gemini(cert_data)
+        google_result = check_url_with_google_safe_browsing(f"https://{hostname}")
+        risk = calculate_risk(cert_data, google_result, feedback)
+
         return jsonify({
             "hostname": hostname,
             "certificate": cert_data,
-            "feedback": feedback
+            "feedback": feedback,
+            "google_safe_browsing": google_result,
+            "risk_level": risk
         })
+
     except Exception as e:
         logger.error(f"Unhandled error for hostname {hostname}: {e}")
         return jsonify({"error": "Failed to analyze SSL certificate. Please check the domain and try again."}), 500
 
+# === RUN ===
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
