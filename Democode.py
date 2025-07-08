@@ -8,6 +8,7 @@ from flask_cors import CORS
 import logging
 import re
 import requests
+import traceback
 
 # === CONFIG ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -29,17 +30,19 @@ def is_valid_hostname(hostname):
 def get_certificate_info(hostname):
     context = ssl.create_default_context()
     try:
+        logger.info(f"📡 Connecting to {hostname}:443 for SSL cert")
         with socket.create_connection((hostname, 443), timeout=10) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 return ssock.getpeercert()
-    except socket.gaierror:
+    except socket.gaierror as e:
+        logger.error(f"🧨 DNS lookup failed for '{hostname}': {e}")
         raise Exception(f"DNS lookup failed for hostname '{hostname}'.")
     except ssl.SSLCertVerificationError as e:
-        logger.warning(f"SSL cert verification error for {hostname}: {e}")
-        raise e
+        logger.warning(f"🔐 SSL cert verification error for {hostname}: {e}")
+        raise Exception(f"SSL certificate verification failed for '{hostname}'.")
     except Exception as e:
-        logger.error(f"Error retrieving cert for {hostname}: {e}")
-        raise e
+        logger.error(f"❗ General SSL cert retrieval error for {hostname}: {e}")
+        raise Exception(f"Could not retrieve SSL certificate: {str(e)}")
 
 def verify_certificate(cert):
     result = {}
@@ -54,7 +57,7 @@ def verify_certificate(cert):
         result['valid'] = False
         result['valid_from'] = 'Invalid date'
         result['valid_until'] = 'Invalid date'
-        logger.warning(f"Date parsing error: {e}")
+        logger.warning(f"⚠️ Date parsing error: {e}")
 
     issuer_info = {}
     for item in cert.get('issuer', []):
@@ -98,8 +101,8 @@ def generate_feedback_with_gemini(cert_data):
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        logger.error(f"Gemini feedback error: {e}")
-        return "Could not generate AI feedback due to internal error."
+        logger.error(f"🤖 Gemini feedback error: {e}")
+        return "AI feedback unavailable due to internal error."
 
 def check_url_with_google_safe_browsing(url_to_check):
     endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_API_KEY}"
@@ -125,7 +128,7 @@ def check_url_with_google_safe_browsing(url_to_check):
             return {"safe": False, "details": result["matches"]}
         return {"safe": True, "details": None}
     except Exception as e:
-        logger.error(f"Safe Browsing API error: {e}")
+        logger.error(f"🛡️ Google Safe Browsing API error: {e}")
         return {"safe": None, "error": "Google Safe Browsing check failed."}
 
 def calculate_risk(cert_data, google_check, feedback):
@@ -156,6 +159,7 @@ def calculate_risk(cert_data, google_check, feedback):
 def check_ssl():
     data = request.get_json()
     hostname = data.get('hostname')
+    logger.info(f"🔍 Incoming SSL check for: {hostname}")
 
     if not hostname:
         return jsonify({"error": "Hostname is required."}), 400
@@ -167,6 +171,11 @@ def check_ssl():
     try:
         cert = get_certificate_info(hostname)
         cert_data = verify_certificate(cert)
+    except Exception as ssl_error:
+        logger.warning(f"⚠️ SSL certificate could not be retrieved: {ssl_error}")
+        return jsonify({"error": str(ssl_error)}), 500
+
+    try:
         feedback = generate_feedback_with_gemini(cert_data)
         google_result = check_url_with_google_safe_browsing(f"https://{hostname}")
         risk = calculate_risk(cert_data, google_result, feedback)
@@ -180,8 +189,8 @@ def check_ssl():
         })
 
     except Exception as e:
-        logger.error(f"Unhandled error for hostname {hostname}: {e}")
-        return jsonify({"error": "Failed to analyze SSL certificate. Please check the domain and try again."}), 500
+        logger.error(f"❌ Unexpected error:\n{traceback.format_exc()}")
+        return jsonify({"error": f"Internal error during analysis: {str(e)}"}), 500
 
 # === RUN ===
 if __name__ == '__main__':
